@@ -37,6 +37,13 @@
 '    Fixed INTEGER field types to handle null data, now will insert 0, used to '
 '     break it by inserting nothing.  Also modified to accept database path    '
 '     from the command line as an argument.                                    '
+'  2009-01-21 <lito@list.ru>                                                   '
+'    Added function for exportIndexes - create Indexes (except Primary Key)    '
+'    Added NOT NULL and DEFAULT values in CREATE TABLE (Now() = CURRENT_TIMESTAMP)          
+'    Fixed CREATE TABLE without Primary Key                                    '
+'    Added creating TRIGGERs instead of FOREIGN KEY constraits.                '
+'    Added Const dbExportData for genereting scripts without INSERT instructions
+'    Added type INTEGER PRIMARY KEY for field type COUNTER
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 Option Explicit
 If LCase(Right(Wscript.FullName, 11)) = "wscript.exe" Then
@@ -51,6 +58,13 @@ If LCase(Right(Wscript.FullName, 11)) = "wscript.exe" Then
 End If
 
 Const dbUseJet = 2
+
+'=========================================================
+'Script managment constants
+'Export INSERT instructions
+Const bExportInsert = False
+'Create Triggers
+Const bExportTrigger = True
 
 'dao datatypes
 Const dbBoolean    = 1   
@@ -74,6 +88,11 @@ Const dbDecimal    = 20
 Const dbFloat      = 21  
 Const dbTime       = 22  
 Const dbTimeStamp  = 23  
+
+'References constants and field attributs
+Const dbRelationDeleteCascade = 4096
+Const dbRelationUpdateCascade = 256
+Const dbAutoIncrField         = 16
 
 Dim sql_keywords1, sql_keywords2
 
@@ -173,12 +192,13 @@ Private Sub exportDatabaseTable(ByRef db , tabla , ts )
     Dim print_string
     Dim columna
     Dim field_type 
-    dim v
+    dim v, i
     
     Set rcrdSet = db.OpenRecordset("SELECT * FROM " & tabla.name)
-    WScript.Echo "Data"
+    WScript.Echo "   Export Data..."
+    i = 1
     While (Not rcrdSet.EOF)
-        print_string = "INSERT INTO " & tabla.name & " VALUES ("
+        print_string = "INSERT INTO " & sql_name(tabla.name) & " VALUES ("
         
         For each columna in rcrdSet.Fields
             field_type = getSQLiteFieldType(columna,False)
@@ -190,8 +210,7 @@ Private Sub exportDatabaseTable(ByRef db , tabla , ts )
                     v=replace(v, chr(11), "'||chr(11)||'")
                     v=replace(v, chr(12), "'||chr(12)||'")
                     v=replace(v, chr(13), "'||chr(13)||'")
-                    v=replace(v, chr(9), "'||chr(9)||'")
-                    
+                    v=replace(v, chr(9), "'||chr(9)||'")						
                     print_string = print_string & "'" & v & "', "
                 Else
                     print_string = print_string & "NULL, "
@@ -201,7 +220,7 @@ Private Sub exportDatabaseTable(ByRef db , tabla , ts )
                 if isnull(v) then
                     print_string = print_string & "NULL, "
                 else
-                    print_string = print_string & "TO_DATE('"& fechaCadena(v) & "', 'YYYY-MM-DD HH24:MI:SS'), "
+                    print_string = print_string & "DATETIME('"& fechaCadena(v) & "', 'YYYY-MM-DD HH24:MI:SS'), "
                 End If
             ElseIf (field_type = "BOOLEAN") Then
                 If (columna.Value = True) Then
@@ -240,32 +259,139 @@ Private Sub exportDatabaseTable(ByRef db , tabla , ts )
             err.clear
         end if
         rcrdSet.MoveNext
+        if i mod 10000 = 0 then
+          WScript.Echo "   Exported " & i & " rows"
+        end if
+        i = i + 1
     Wend
     
     rcrdSet.Close
     
 End Sub
+
 private sub exportaReferencias(db,ts)
     dim ret
     dim ref
     dim columna
     for each ref in db.relations
-        ts.write "alter table " & ref.foreigntable & " add constraint fk_" & ref.foreigntable & "_" & ref.table & "foreign key(" 
+        ts.write "ALTER TABLE " & ref.foreigntable & " ADD CONSTRAINT fk_" & ref.foreigntable & "_" & ref.table & " FOREIGN KEY(" 
         ret=""
     
         for each columna in ref.fields
             ret= ret & "," & columna.name
         next
         ts.write mid(ret,2)
-        ts.writeline ")references " & ref.table & colsClave(db.tabledefs(ref.table)) & ";"
+        ts.write ") REFERENCES " & ref.table & colsClave(db.tabledefs(ref.table)) 
+        if ref.Attributes and dbRelationDeleteCascade then
+          ts.write " ON DELETE CASCADE"
+        end if
+        if ref.Attributes and dbRelationUpdateCascade then
+          ts.write " ON UPDATE CASCADE"
+        end if
+        ts.writeline ";"
+        if bExportTrigger then
+          call createTrigger(db, ref, ts)
+        end if
     next
 end sub
+
+function get_trigger_name(trigger_type, ptname, pcname, ftname, fcname)
+  get_trigger_name = trigger_type & "_" & ptname & "_" & pcname & "_" & ftname & "_" & fcname
+end function
+
+function null_sql(fcname, nullable)
+    null_sql = ""
+    if not nullable then
+        null_sql = "NEW." & fcname & " IS NOT NULL AND "
+    end if
+end function
+
+sub createTrigger(db, ref, ts)
+  dim trigger_name
+  dim ptname, pcname, ftname, fcname, col
+  Dim str1, str2
+  Dim print_string 
+
+    ptname = ref.table
+    pcname = ref.Fields(0).Name
+    ftname = ref.ForeignTable
+    fcname = ref.Fields(0).ForeignName
+    '/* table */
+    ts.writeline 
+    trigger_name = get_trigger_name("fki", ptname, pcname, ftname, fcname)
+    print_string = "CREATE TRIGGER " & trigger_name & " BEFORE INSERT ON " & ftname & _
+                   " FOR EACH ROW BEGIN" & _
+                   " SELECT RAISE(ABORT, 'insert on table " & ftname & " violates foreign key constraint " & trigger_name & "')"
+    print_string = print_string & " WHERE " 
+    str1="" : str2=""
+    for each col in ref.Fields
+      str1 = str1 & null_sql(col.ForeignName, db.TableDefs(ftname).Fields(col.ForeignName).Required) 
+      str2 = str2 & " AND " & col.Name & "=NEW." & col.ForeignName
+    next
+    print_string = print_string & str1 & "(SELECT " & pcname & " FROM " & ptname & " WHERE " & Mid(str2, 6) & ") IS NULL;"
+    ts.writeline print_string & "END;" 
+    '------------------------------------
+    if ref.Attributes and dbRelationUpdateCascade then
+      trigger_name = get_trigger_name("fkuc", ptname, pcname, ftname, fcname)
+      print_string = "CREATE TRIGGER " & trigger_name & " AFTER UPDATE ON " & ptname & _
+                     " FOR EACH ROW BEGIN"      
+      str1="" : str2=""
+      for each col in ref.Fields
+        str1 = str1 & "," & col.ForeignName & "=NEW." & col.Name
+        str2 = str2 & " AND " & col.ForeignName & "=OLD." & col.Name
+      next      
+      print_string = print_string & " UPDATE " & ftname & " SET " & Mid(str1, 2) & _
+                    "  WHERE " & Mid(str2, 6) & ";"
+      ts.writeline print_string & "END;"
+    end if
+    '------------------------------------
+    trigger_name = get_trigger_name("fku", ptname, pcname, ftname, fcname)
+    print_string = "CREATE TRIGGER " & trigger_name & " BEFORE UPDATE ON " & ftname & _
+                   " FOR EACH ROW BEGIN" & _
+                   " SELECT RAISE(ABORT, 'update on table " & ftname & " violates foreign key constraint " & trigger_name & "')"
+    print_string = print_string & " WHERE " 
+    str1="" : str2=""
+    for each col in ref.Fields
+      str1 = str1 & null_sql(col.ForeignName, db.TableDefs(ftname).Fields(col.ForeignName).Required) 
+      str2 = str2 & " AND " & col.Name & "=NEW." & col.ForeignName
+    next
+    print_string = print_string & str1 & "(SELECT " & pcname & " FROM " & ptname & " WHERE " & Mid(str2, 6) & ") IS NULL;"
+    ts.writeline print_string & "END;"
+    '------------------------------------
+    ' foreign table 
+    if ref.Attributes and dbRelationDeleteCascade then
+      'CASCADE
+      trigger_name = get_trigger_name("fkdc", ptname, pcname, ftname, fcname)
+      print_string = "CREATE TRIGGER " & trigger_name & " BEFORE DELETE ON " & ptname & _
+                     " FOR EACH ROW BEGIN" & _
+                     " DELETE FROM " & ftname & " WHERE " 
+      str2=""
+      for each col in ref.Fields     
+        str2 = str2 & " AND " & ftname & "." & col.ForeignName & "=OLD." & col.Name
+      next
+      print_string = print_string & Mid(str2, 6) & ";"
+      ts.writeline print_string & "END;"
+    else
+      trigger_name = get_trigger_name("fkd", ptname, pcname, ftname, fcname)
+      print_string = "CREATE TRIGGER " & trigger_name & " BEFORE DELETE ON " & ptname & _
+                     " FOR EACH ROW BEGIN" & _
+                     " SELECT RAISE(ABORT, 'delete on table " & ptname & " violates foreign key constraint " & trigger_name & "')" & _
+                     " WHERE " 
+      str2=""
+      for each col in ref.Fields     
+        str2 = str2 & " AND " & col.ForeignName & "=OLD." & col.Name
+      next
+      print_string = print_string & "(SELECT " & fcname & " FROM " & ftname & " WHERE " & Mid(str2, 6) & ") IS NOT NULL;"
+      ts.writeline print_string & "END;"
+    end if
+end sub
+
 private function colsClave(tabla)
 On Error Resume Next
     dim clave
     dim print_string
     dim col
-    set clave=tabla.indexes("PrimaryKey")
+    set clave = tabla.indexes("PrimaryKey")
     print_string=""
     for each col in clave.fields
         print_string =  print_string & "," & col.name 
@@ -275,6 +401,31 @@ On Error Resume Next
     colsClave="(" & mid(print_string ,2) & ")"
 
 end function
+
+private sub exportIndexes(tabla, ts)
+On Error Resume Next
+    dim clave
+    dim print_string
+    dim col
+    dim cols
+    dim bUniq
+    dim idx
+    for each idx in tabla.indexes
+      print_string=""
+      for each col in idx.fields
+        print_string =  print_string & "," & col.name 
+      next 
+      cols="(" & mid(print_string ,2) & ")"
+      if not idx.Primary then 'and not idx.Foreign then 
+        if idx.Unique then 
+          print_string =  "CREATE UNIQUE INDEX "
+        else
+          print_string =  "CREATE INDEX "
+        end if
+        ts.writeline print_string & "idx_" & tabla.name & "_" & idx.name & " ON " & tabla.name & cols & ";"
+      end if
+    next 
+end sub
 
 Private Sub exportDatabase(ByVal database_path , ByVal username , ByVal password , _
                            ByVal outfile )
@@ -291,6 +442,7 @@ Private Sub exportDatabase(ByVal database_path , ByVal username , ByVal password
     dim dbEng
     dim col
     dim ref
+    dim bAutoInc
     
     ' Create Microsoft Jet Workspace object.
     set dbEng=createobject("DAO.DBEngine.36")
@@ -302,15 +454,16 @@ Private Sub exportDatabase(ByVal database_path , ByVal username , ByVal password
     Set fso = CreateObject("Scripting.FileSystemObject")
     Set ts = fso.CreateTextFile(outfile, True)
     
-    ts.writeline "SET DEFINE OFF;" 'Así no fastidian los caracteres &
+    'ts.writeline "SET DEFINE OFF;" 'Así no fastidian los caracteres &
     For each tabla in db.TableDefs
     		if LCASE(LEFT(tabla.name,4)) <> "msys" Then
 	      table_name = tabla.name
         table_sql_name = sql_name(table_name)
         If Left(table_name, 4) <> "MSys" Then
             WScript.Echo tabla.name
-            ts.writeline "DROP TABLE " & table_sql_name & ";"
-            ts.writeline "COMMIT;"
+            bAutoInc = False
+            ts.writeline "BEGIN TRANSACTION;"
+            ts.writeline "DROP TABLE IF EXISTS " & table_sql_name & ";"
             print_string = "CREATE TABLE " & table_sql_name & " ( "
             For each columna in tabla.Fields
                 field_name = columna.name
@@ -319,15 +472,29 @@ Private Sub exportDatabase(ByVal database_path , ByVal username , ByVal password
                 if field_type <> "BINARY" then
                     print_string = print_string & field_sql_name & " "
                     print_string = print_string & field_type 
+                    if columna.Attributes and dbAutoIncrField then
+                        print_string = print_string & " PRIMARY KEY"
+                        bAutoInc = True
+                    end if
                     if columna.required then
                         print_string = print_string & " NOT NULL"
+                    end if
+                    if columna.defaultValue <> "" then
+                      if columna.DefaultValue = "Now()" then
+                        print_string = print_string & " DEFAULT CURRENT_TIMESTAMP"
+                      else
+                        print_string = print_string & " DEFAULT " & columna.DefaultValue
+                      end if
                     end if
                     print_string = print_string & ", "
                 end if
             Next 
-            ts.writeline print_string
-            ts.write " primary key "
-            ts.write colsClave(tabla)
+            ts.write Left(print_string, Len(print_string) - 2)
+            if not bAutoInc and colsClave(tabla) <> "()" then
+              ts.writeline ","
+              ts.write " primary key "
+              ts.write colsClave(tabla)
+            end if
             ts.writeline ");"
             
             For each columna in tabla.Fields
@@ -337,14 +504,19 @@ Private Sub exportDatabase(ByVal database_path , ByVal username , ByVal password
                 End If
             Next 
             
-            Call exportDatabaseTable(db, tabla, ts)
+            exportIndexes tabla, ts
+
+            if bExportInsert then
+                Call exportDatabaseTable(db, tabla, ts)
+            end if
+            ts.writeline "COMMIT TRANSACTION;"
         End If
     		End if
     Next 
     
     exportaReferencias db,ts
 
-    ts.writeline "QUIT;" 'Si no, se queda
+    'ts.writeline ".Q" 'Si no, se queda
     ts.close
     
     db.Close
